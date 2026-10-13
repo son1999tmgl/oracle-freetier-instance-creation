@@ -67,7 +67,7 @@ OCI_COMPUTE_SHAPE = os.getenv("OCI_COMPUTE_SHAPE", ARM_SHAPE).strip()
 OCPUS = int(os.getenv("OCPUS", "4").strip())
 RAM_IN_GBS = int(os.getenv("RAM_IN_GBS", "24").strip())
 BOOT_VOLUME_SIZE = max(50, int(os.getenv("BOOT_VOLUME_SIZE", "200").strip()))
-REQUEST_WAIT_TIME_SECS = max(30, int(os.getenv("REQUEST_WAIT_TIME_SECS", "50").strip()))
+REQUEST_WAIT_TIME_SECS = max(60, int(os.getenv("REQUEST_WAIT_TIME_SECS", "60").strip()))
 
 OPERATING_SYSTEM = os.getenv("OPERATING_SYSTEM", "Canonical Ubuntu").strip()
 OS_VERSION = os.getenv("OS_VERSION", "22.04 Minimal aarch64").strip()
@@ -364,5 +364,6 @@ if __name__ == "__main__":
         logger.critical(f"[LOI FATAL]: {fatal}", exc_info=True)
         send_notification(f"âŒ [OCI Hunter] Script bi dung do loi: {fatal}")
         sys.exit(1)
+
 
 
