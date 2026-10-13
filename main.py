@@ -1,547 +1,334 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Oracle Cloud Infrastructure (OCI) Always-Free Instance Hunter
+Chuyen dung san VPS ARM Ampere VM.Standard.A1.Flex tai Tokyo (ap-tokyo-1)
+Chay ben bi 24/7 tren Koyeb Worker hoac Local Machine.
+"""
+
 import configparser
+import datetime
 import itertools
 import json
 import logging
 import os
-import smtplib
+import random
 import sys
 import time
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Union
 
-import oci
-import paramiko
-from dotenv import load_dotenv
-import requests
+try:
+    import oci
+except ImportError:
+    print("[LOI] Chua cai dat thu vien 'oci'. Hay chay: pip install -r requirements.txt")
+    sys.exit(1)
 
-# Load environment variables from .env file
+try:
+    import requests
+except ImportError:
+    requests = None
+
+from dotenv import load_dotenv
+
+# Load bien moi truong tu oci.env neu co
 load_dotenv('oci.env')
 
+# Setup Logging dong thoi ra Console (cho Koyeb) va file log
+# Đảm bảo StreamHandler hỗ trợ UTF-8 cả trên Windows console và Linux/Koyeb
+if sys.platform == "win32":
+    import io
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(sys.stdout),
+        logging.FileHandler("launch_instance.log", encoding="utf-8")
+    ]
+)
+logger = logging.getLogger("OCI_Hunter")
+
+# -------------------------------------------------------------
+# 1. CAC THAM SO CAU HINH
+# -------------------------------------------------------------
 ARM_SHAPE = "VM.Standard.A1.Flex"
 E2_MICRO_SHAPE = "VM.Standard.E2.1.Micro"
 
-# Access loaded environment variables and strip white spaces
-OCI_CONFIG = os.getenv("OCI_CONFIG", "").strip()
-OCT_FREE_AD = os.getenv("OCT_FREE_AD", "").strip()
-DISPLAY_NAME = os.getenv("DISPLAY_NAME", "").strip()
-WAIT_TIME = int(os.getenv("REQUEST_WAIT_TIME_SECS", "0").strip())
-SSH_AUTHORIZED_KEYS_FILE = os.getenv("SSH_AUTHORIZED_KEYS_FILE", "").strip()
-OCI_IMAGE_ID = os.getenv("OCI_IMAGE_ID", None).strip() if os.getenv("OCI_IMAGE_ID") else None
+DISPLAY_NAME = os.getenv("DISPLAY_NAME", "Tokyo-ARM-AlwaysFree").strip()
+OCT_FREE_AD = os.getenv("OCT_FREE_AD", "AD-1").strip()
 OCI_COMPUTE_SHAPE = os.getenv("OCI_COMPUTE_SHAPE", ARM_SHAPE).strip()
-SECOND_MICRO_INSTANCE = os.getenv("SECOND_MICRO_INSTANCE", 'False').strip().lower() == 'true'
-OCI_SUBNET_ID = os.getenv("OCI_SUBNET_ID", None).strip() if os.getenv("OCI_SUBNET_ID") else None
-OPERATING_SYSTEM = os.getenv("OPERATING_SYSTEM", "").strip()
-OS_VERSION = os.getenv("OS_VERSION", "").strip()
-ASSIGN_PUBLIC_IP = os.getenv("ASSIGN_PUBLIC_IP", "false").strip()
-BOOT_VOLUME_SIZE = os.getenv("BOOT_VOLUME_SIZE", "50").strip()
-NOTIFY_EMAIL = os.getenv("NOTIFY_EMAIL", 'False').strip().lower() == 'true'
-EMAIL = os.getenv("EMAIL", "").strip()
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "").strip()
+OCPUS = int(os.getenv("OCPUS", "4").strip())
+RAM_IN_GBS = int(os.getenv("RAM_IN_GBS", "24").strip())
+BOOT_VOLUME_SIZE = max(50, int(os.getenv("BOOT_VOLUME_SIZE", "200").strip()))
+REQUEST_WAIT_TIME_SECS = max(30, int(os.getenv("REQUEST_WAIT_TIME_SECS", "50").strip()))
+
+OPERATING_SYSTEM = os.getenv("OPERATING_SYSTEM", "Canonical Ubuntu").strip()
+OS_VERSION = os.getenv("OS_VERSION", "22.04 Minimal aarch64").strip()
+ASSIGN_PUBLIC_IP = os.getenv("ASSIGN_PUBLIC_IP", "true").strip().lower() in ["true", "1", "yes"]
+OCI_SUBNET_ID = os.getenv("OCI_SUBNET_ID", "").strip() or None
+OCI_IMAGE_ID = os.getenv("OCI_IMAGE_ID", "").strip() or None
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
+SSH_AUTHORIZED_KEYS_FILE = os.getenv("SSH_AUTHORIZED_KEYS_FILE", "./id_rsa.pub").strip()
 
-# Read the configuration from oci_config file
-config = configparser.ConfigParser()
-try:
-    config.read(OCI_CONFIG)
-    OCI_USER_ID = config.get('DEFAULT', 'user')
-    if OCI_COMPUTE_SHAPE not in (ARM_SHAPE, E2_MICRO_SHAPE):
-        raise ValueError(f"{OCI_COMPUTE_SHAPE} is not an acceptable shape")
-    env_has_spaces = any(isinstance(confg_var, str) and " " in confg_var
-                        for confg_var in [OCI_CONFIG, OCT_FREE_AD,WAIT_TIME,
-                                SSH_AUTHORIZED_KEYS_FILE, OCI_IMAGE_ID, 
-                                OCI_COMPUTE_SHAPE, SECOND_MICRO_INSTANCE, 
-                                OCI_SUBNET_ID, OS_VERSION, NOTIFY_EMAIL,EMAIL,
-                                EMAIL_PASSWORD, DISCORD_WEBHOOK]
-                        )
-    config_has_spaces = any(' ' in value for section in config.sections() 
-                            for _, value in config.items(section))
-    if env_has_spaces:
-        raise ValueError("oci.env has spaces in values which is not acceptable")
-    if config_has_spaces:
-        raise ValueError("oci_config has spaces in values which is not acceptable")        
+# Credentials qua Env (cho Koyeb Secrets) hoac qua File
+OCI_CONFIG_FILE = os.getenv("OCI_CONFIG", "./oci_config").strip()
+OCI_KEY_CONTENT = os.getenv("OCI_KEY_CONTENT", "").strip()
+SSH_KEY_CONTENT = os.getenv("SSH_AUTHORIZED_KEY_CONTENT", "").strip()
 
-except configparser.NoSectionError:
-    msg = (
-        "oci_config is missing the [DEFAULT] section. "
-        "Ensure your config file matches the format shown in sample_oci_config."
-    )
-    with open("ERROR_IN_CONFIG.log", "w", encoding='utf-8') as file:
-        file.write(msg)
-    print(msg)
-
-except configparser.NoOptionError:
-    msg = (
-        "oci_config is missing the 'user' key under [DEFAULT]. "
-        "Copy the OCID from your OCI profile and add: user=ocid1.user.oc1..<your-ocid>. "
-        "Refer to sample_oci_config for the expected format."
-    )
-    with open("ERROR_IN_CONFIG.log", "w", encoding='utf-8') as file:
-        file.write(msg)
-    print(msg)
-
-except configparser.Error as e:
-    with open("ERROR_IN_CONFIG.log", "w", encoding='utf-8') as file:
-        file.write(str(e))
-
-    print(f"Error reading the configuration file: {e}")
-
-# Set up logging
-logging.basicConfig(
-    filename="setup_and_info.log",
-    level=logging.INFO,
-    format="%(asctime)s - %(levelname)s - %(message)s",
-)
-logging_step5 = logging.getLogger("launch_instance")
-logging_step5.setLevel(logging.INFO)
-fh = logging.FileHandler("launch_instance.log")
-fh.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
-logging_step5.addHandler(fh)
-
-# Set up OCI Config and Clients
-oci_config_path = OCI_CONFIG if OCI_CONFIG else "~/.oci/config"
-config = oci.config.from_file(oci_config_path)
-iam_client = oci.identity.IdentityClient(config)
-network_client = oci.core.VirtualNetworkClient(config)
-compute_client = oci.core.ComputeClient(config)
-
-IMAGE_LIST_KEYS = [
-    "lifecycle_state",
-    "display_name",
-    "id",
-    "operating_system",
-    "operating_system_version",
-    "size_in_mbs",
-    "time_created",
-]
-
-
-def write_into_file(file_path, data):
-    """Write data into a file.
-
-    Args:
-        file_path (str): The path of the file.
-        data (str): The data to be written into the file.
-    """
-    with open(file_path, mode="a", encoding="utf-8") as file_writer:
-        file_writer.write(data)
-
-
-def send_email(subject, body, email, password):
-    """Send an HTML email using the SMTP protocol.
-
-    Args:
-        subject (str): The subject of the email.
-        body (str): The HTML body/content of the email.
-        email (str): The sender's email address.
-        password (str): The sender's email password or app-specific password.
-
-    Raises:
-        smtplib.SMTPException: If an error occurs during the SMTP communication.
-    """
-    # Set up the MIME
-    message = MIMEMultipart()
-    message["Subject"] = subject
-    message["From"] = email
-    message["To"] = email
-
-    # Attach HTML content to the email
-    html_body = MIMEText(body, "html")
-    message.attach(html_body)
-
-    # Connect to the SMTP server
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+def initialize_oci_config() -> dict:
+    """Khoi tao dictionary cau hinh OCI cho SDK"""
+    # 1. Truong hop truyen truc tiep Key qua ENV (Deploy tren Koyeb)
+    if OCI_KEY_CONTENT:
+        key_target_path = Path("/tmp/oci_api_private_key.pem") if os.name != 'nt' else Path("./oci_api_private_key.pem")
+        key_target_path.write_text(OCI_KEY_CONTENT.replace("\\n", "\n"), encoding="utf-8")
         try:
-            # Start TLS for security
-            server.starttls()
-            # Login to the server
-            server.login(email, password)
-            # Send the email
-            server.sendmail(email, email, message.as_string())
-        except smtplib.SMTPException as mail_err:
-            # Handle SMTP exceptions (e.g., authentication failure, connection issues)
-            logging.error("Error while sending email: %s", mail_err)
-            raise
+            os.chmod(str(key_target_path), 0o600)
+        except Exception:
+            pass
+        logger.info(f"Da tao khoa OCI Private Key tu bien moi truong tai {key_target_path}")
 
+        if os.getenv("OCI_USER_ID") and os.getenv("OCI_TENANCY_ID") and os.getenv("OCI_FINGERPRINT"):
+            return {
+                "user": os.getenv("OCI_USER_ID").strip(),
+                "fingerprint": os.getenv("OCI_FINGERPRINT").strip(),
+                "tenancy": os.getenv("OCI_TENANCY_ID").strip(),
+                "region": os.getenv("OCI_REGION", "ap-tokyo-1").strip(),
+                "key_file": str(key_target_path.resolve())
+            }
 
-def list_all_instances(compartment_id):
-    """Retrieve a list of all instances in the specified compartment.
+    # 2. Truong hop doc tu file oci_config
+    if not os.path.exists(OCI_CONFIG_FILE):
+        logger.error(f"[LOI] Khong tim thay file cau hinh OCI tai: {OCI_CONFIG_FILE}")
+        logger.info("-> Vui long tao file oci_config hoac thiet lap bien moi truong OCI_KEY_CONTENT, OCI_USER_ID...")
+        sys.exit(1)
 
-    Args:
-        compartment_id (str): The compartment ID.
+    parser = configparser.ConfigParser()
+    parser.read(OCI_CONFIG_FILE)
+    if "DEFAULT" not in parser:
+        logger.error("[LOI] File oci_config thieu section [DEFAULT]")
+        sys.exit(1)
 
-    Returns:
-        list: The list of instances returned from the OCI service.
-    """
-    return execute_oci_command(
-        compute_client,
-        "list_instances",
+    cfg = dict(parser["DEFAULT"])
+    raw_key_path = cfg.get("key_file", "")
+    if not os.path.isabs(raw_key_path):
+        base_dir = Path(OCI_CONFIG_FILE).resolve().parent
+        cfg["key_file"] = str((base_dir / raw_key_path).resolve())
+
+    if not os.path.exists(cfg["key_file"]):
+        logger.error(f"[LOI] Khong tim thay file khoa Private Key tai: {cfg['key_file']}")
+        sys.exit(1)
+
+    return cfg
+
+oci_config_dict = initialize_oci_config()
+
+# Khoi tao OCI Clients
+try:
+    oci.config.validate_config(oci_config_dict)
+    iam_client = oci.identity.IdentityClient(oci_config_dict)
+    network_client = oci.core.VirtualNetworkClient(oci_config_dict)
+    compute_client = oci.core.ComputeClient(oci_config_dict)
+    logger.info(f"[OK] Khoi tao OCI Client thanh cong cho Region: {oci_config_dict['region']}")
+except Exception as e:
+    logger.error(f"[LOI] Xac thuc cau hinh OCI that bai: {e}")
+    sys.exit(1)
+
+# -------------------------------------------------------------
+# 2. CAC HAM TIEN ICH
+# -------------------------------------------------------------
+def send_notification(msg: str):
+    """Gui thong bao toi Discord Webhook"""
+    if DISCORD_WEBHOOK and requests:
+        try:
+            requests.post(DISCORD_WEBHOOK, json={"content": msg}, timeout=10)
+        except Exception as ex:
+            logger.warning(f"Khong the gui thong bao Discord: {ex}")
+
+def get_ssh_public_key() -> str:
+    """Lay SSH Public Key de inject vao VPS"""
+    if SSH_KEY_CONTENT:
+        return SSH_KEY_CONTENT.strip()
+
+    pub_path = Path(SSH_AUTHORIZED_KEYS_FILE)
+    if pub_path.exists():
+        return pub_path.read_text(encoding="utf-8").strip()
+
+    logger.info(f"Khong tim thay {SSH_AUTHORIZED_KEYS_FILE}, dang tu dong sinh SSH keypair RSA 2048...")
+    import paramiko
+    key = paramiko.RSAKey.generate(2048)
+    priv_path = pub_path.with_name("id_rsa")
+    key.write_private_key_file(str(priv_path))
+    pub_key_str = f"ssh-rsa {key.get_base64()} oci-arm-key"
+    pub_path.write_text(pub_key_str, encoding="utf-8")
+    logger.info(f"[OK] Da luu Private Key tai '{priv_path}' va Public Key tai '{pub_path}'")
+    return pub_key_str
+
+def get_target_image_id(compartment_id: str) -> str:
+    """Tim kiem Image ID phu hop Ubuntu ARM trong Region"""
+    if OCI_IMAGE_ID:
+        return OCI_IMAGE_ID
+
+    logger.info(f"Dang truy van Image ID cho {OPERATING_SYSTEM} ({OS_VERSION}) tren {OCI_COMPUTE_SHAPE}...")
+    images = compute_client.list_images(
         compartment_id=compartment_id,
-    )
+        shape=OCI_COMPUTE_SHAPE,
+        sort_by="TIMECREATED",
+        sort_order="DESC"
+    ).data
 
+    # Tim chinh xac theo he dieu hanh va phien ban
+    for img in images:
+        if OPERATING_SYSTEM.lower() in img.operating_system.lower():
+            if not OS_VERSION or OS_VERSION.lower() in img.display_name.lower():
+                logger.info(f"-> Chon Image: {img.display_name} (ID: {img.id})")
+                return img.id
 
-def generate_html_body(instance):
-    """Generate HTML body for the email with instance details.
+    # Fallback tim Ubuntu bat ky tuong thich ARM
+    for img in images:
+        if "ubuntu" in img.display_name.lower():
+            logger.info(f"-> Fallback chon Image: {img.display_name} (ID: {img.id})")
+            return img.id
 
-    Args:
-        instance (dict): The instance dictionary returned from the OCI service.
+    if images:
+        return images[0].id
+    raise RuntimeError("Khong tim thay Image tuong thich ARM nao trong Compartment.")
 
-    Returns:
-        str: HTML body for the email.
-    """
-    # Replace placeholders with instance details
-    with open('email_content.html', 'r', encoding='utf-8') as email_temp:
-        html_template = email_temp.read()
-    html_body = html_template.replace('&lt;INSTANCE_ID&gt;', instance.id)
-    html_body = html_body.replace('&lt;DISPLAY_NAME&gt;', instance.display_name)
-    html_body = html_body.replace('&lt;AD&gt;', instance.availability_domain)
-    html_body = html_body.replace('&lt;SHAPE&gt;', instance.shape)
-    html_body = html_body.replace('&lt;STATE&gt;', instance.lifecycle_state)
-
-    return html_body
-
-
-def create_instance_details_file_and_notify(instance, shape=ARM_SHAPE):
-    """Create a file with details of instances and notify the user.
-
-    Args:
-        instance (dict): The instance dictionary returned from the OCI service.
-        shape (str): shape of the instance to be created, acceptable values are
-         "VM.Standard.A1.Flex", "VM.Standard.E2.1.Micro"
-    """
-    details = [f"Instance ID: {instance.id}",
-               f"Display Name: {instance.display_name}",
-               f"Availability Domain: {instance.availability_domain}",
-               f"Shape: {instance.shape}",
-               f"State: {instance.lifecycle_state}",
-               "\n"]
-    micro_body = 'TWo Micro Instances are already existing and running'
-    arm_body = '\n'.join(details)
-    body = arm_body if shape == ARM_SHAPE else micro_body
-    write_into_file('INSTANCE_CREATED', body)
-
-    # Generate HTML body for email
-    html_body = generate_html_body(instance)
-
-    if NOTIFY_EMAIL:
-        send_email('OCI INSTANCE CREATED', html_body, EMAIL, EMAIL_PASSWORD)
-
-
-def notify_on_failure(failure_msg):
-    """Notifies users when the Instance Creation Failed due to an error that's
-    not handled.
-
-    Args:
-        failure_msg (msg): The error message.
-    """
-
-    mail_body = (
-        "The script encountered an unhandled error and exited unexpectedly.\n\n"
-        "Please re-run the script by executing './setup_init.sh rerun'.\n\n"
-        "And raise a issue on GitHub if its not already existing:\n"
-        "https://github.com/mohankumarpaluru/oracle-freetier-instance-creation/issues\n\n"
-        " And include the following error message to help us investigate and resolve the problem:\n\n"
-        f"{failure_msg}"
-    )
-    write_into_file('UNHANDLED_ERROR.log', mail_body)
-    if NOTIFY_EMAIL:
-        send_email('OCI INSTANCE CREATION SCRIPT: FAILED DUE TO AN ERROR', mail_body, EMAIL, EMAIL_PASSWORD)
-
-
-def check_instance_state_and_write(compartment_id, shape, states=('RUNNING', 'PROVISIONING'),
-                                   tries=3):
-    """Check the state of instances in the specified compartment and take action when a matching instance is found.
-
-    Args:
-        compartment_id (str): The compartment ID to check for instances.
-        shape (str): The shape of the instance.
-        states (tuple, optional): The lifecycle states to consider. Defaults to ('RUNNING', 'PROVISIONING').
-        tries(int, optional): No of reties until an instance is found. Defaults to 3.
-
-    Returns:
-        bool: True if a matching instance is found, False otherwise.
-    """
-    for _ in range(tries):
-        instance_list = list_all_instances(compartment_id=compartment_id)
-        if shape == ARM_SHAPE:
-            running_arm_instance = next((instance for instance in instance_list if
-                                         instance.shape == shape and instance.lifecycle_state in states), None)
-            if running_arm_instance:
-                create_instance_details_file_and_notify(running_arm_instance, shape)
-                return True
-        else:
-            micro_instance_list = [instance for instance in instance_list if
-                                   instance.shape == shape and instance.lifecycle_state in states]
-            if len(micro_instance_list) > 1 and SECOND_MICRO_INSTANCE:
-                create_instance_details_file_and_notify(micro_instance_list[-1], shape)
-                return True
-            if len(micro_instance_list) == 1 and not SECOND_MICRO_INSTANCE:
-                create_instance_details_file_and_notify(micro_instance_list[-1], shape)
-                return True       
-        if tries - 1 > 0:
-            time.sleep(60)
-
+def check_existing_instance(compartment_id: str) -> bool:
+    """Kiem tra xem may ao ARM da duoc tao va dang hoat dong chua"""
+    instances = compute_client.list_instances(compartment_id=compartment_id).data
+    for inst in instances:
+        if inst.shape == OCI_COMPUTE_SHAPE and inst.lifecycle_state in ["PROVISIONING", "RUNNING"]:
+            logger.info(f"[DA CO SAN] Phat hien VPS {OCI_COMPUTE_SHAPE} dang chay: {inst.display_name} ({inst.id})")
+            return True
     return False
 
+# -------------------------------------------------------------
+# 3. TIEN TRINH SAN VPS TU DONG
+# -------------------------------------------------------------
+def run_hunter():
+    tenancy_id = oci_config_dict["tenancy"]
 
-def handle_errors(command, data, log):
-    """Handles errors and logs messages.
+    # 1. Kiem tra xem may ao da tao chua
+    if check_existing_instance(tenancy_id):
+        logger.info("[HOAN TAT] VPS ARM da ton tai trong tai khoan. Dung chuong trinh de tranh tao trung.")
+        return
 
-    Args:
-        command (arg): The OCI command being executed.
-        data (dict): The data or error information returned from the OCI service.
-        log (logging.Logger): The logger instance for logging messages.
+    # 2. Lay Availability Domains
+    ad_list = iam_client.list_availability_domains(compartment_id=tenancy_id).data
+    target_ads = [ad.name for ad in ad_list if any(ad.name.lower().endswith(tgt.lower()) for tgt in OCT_FREE_AD.split(","))]
+    if not target_ads:
+        target_ads = [ad.name for ad in ad_list]
+    logger.info(f"Availability Domains muc tieu: {target_ads}")
 
-    Returns:
-        bool: True if the error is temporary and the operation should be retried after a delay.
-        Raises Exception for unexpected errors.
-    """
+    # 3. Lay Subnet ID
+    subnet_id = OCI_SUBNET_ID
+    if not subnet_id:
+        subnets = network_client.list_subnets(compartment_id=tenancy_id).data
+        if not subnets:
+            raise RuntimeError("Khong tim thay Subnet nao trong VCN! Vui long tao VCN va Subnet tren OCI Console truoc.")
+        subnet_id = subnets[0].id
+    logger.info(f"Su dung Subnet ID: {subnet_id}")
 
-    # Check for temporary errors that can be retried
-    retryable_codes = {
-        "TooManyRequests",
-        "Out of host capacity.",
-        "InternalError",
-        "RequestException",
-    }
-    retryable_statuses = {502, 503, 504}
-    retryable_messages = (
-        "Out of host capacity.",
-        "Bad Gateway",
-        "Max retries exceeded",
-        "ProxyError",
-        "Tunnel connection failed",
-        "Connection aborted",
-        "ConnectTimeout",
-        "Read timed out",
-    )
-    message = data.get("message", "")
+    # 4. Lay Image ID va SSH Key
+    image_id = get_target_image_id(tenancy_id)
+    ssh_key = get_ssh_public_key()
 
-    if (
-        data.get("code") in retryable_codes
-        or data.get("status") in retryable_statuses
-        or any(retry_msg in message for retry_msg in retryable_messages)
-    ):
-        log.info("Command: %s--\nOutput: %s", command, data)
-        time.sleep(WAIT_TIME)
-        return True
-
-    failure_msg = '\n'.join([f'{key}: {value}' for key, value in data.items()])
-    notify_on_failure(failure_msg)
-    # Raise an exception for unexpected errors
-    raise Exception("Error: %s" % data)
-
-
-def execute_oci_command(client, method, *args, **kwargs):
-    """Executes an OCI command using the specified OCI client.
-
-    Args:
-        client: The OCI client instance.
-        method (str): The method to call on the OCI client.
-        args: Additional positional arguments to pass to the OCI client method.
-        kwargs: Additional keyword arguments to pass to the OCI client method.
-
-    Returns:
-        dict: The data returned from the OCI service.
-
-    Raises:
-        Exception: Raises an exception if an unexpected error occurs.
-    """
-    while True:
-        try:
-            response = getattr(client, method)(*args, **kwargs)
-            data = response.data if hasattr(response, "data") else response
-            return data
-        except oci.exceptions.ServiceError as srv_err:
-            data = {"status": srv_err.status,
-                    "code": srv_err.code,
-                    "message": srv_err.message}
-            handle_errors(args, data, logging_step5)
-        except oci.exceptions.RequestException as req_err:
-            data = {
-                "status": None,
-                "code": "RequestException",
-                "message": str(req_err),
-            }
-            handle_errors(args, data, logging_step5)
-
-
-def generate_ssh_key_pair(public_key_file: Union[str, Path], private_key_file: Union[str, Path]):
-    """Generates an SSH key pair and saves them to the specified files.
-
-    Args:
-        public_key_file :file to save the public key.
-        private_key_file : The file to save the private key.
-    """
-    key = paramiko.RSAKey.generate(2048)
-    key.write_private_key_file(private_key_file)
-    # Save public key to file
-    write_into_file(public_key_file, (f"ssh-rsa {key.get_base64()} "
-                                      f"{Path(public_key_file).stem}_auto_generated"))
-
-
-def read_or_generate_ssh_public_key(public_key_file: Union[str, Path]):
-    """Reads the SSH public key from the file if it exists, else generates and reads it.
-
-    Args:
-        public_key_file: The file containing the public key.
-
-    Returns:
-        Union[str, Path]: The SSH public key.
-    """
-    public_key_path = Path(public_key_file)
-
-    if not public_key_path.is_file():
-        logging.info("SSH key doesn't exist... Generating SSH Key Pair")
-        public_key_path.parent.mkdir(parents=True, exist_ok=True)
-        private_key_path = public_key_path.with_name(f"{public_key_path.stem}_private")
-        generate_ssh_key_pair(public_key_path, private_key_path)
-
-    with open(public_key_path, "r", encoding="utf-8") as pub_key_file:
-        ssh_public_key = pub_key_file.read()
-
-    return ssh_public_key
-
-
-def send_discord_message(message):
-    """Send a message to Discord using the webhook URL if available."""
-    if DISCORD_WEBHOOK:
-        payload = {"content": message}
-        try:
-            response = requests.post(DISCORD_WEBHOOK, json=payload)
-            response.raise_for_status()
-        except requests.RequestException as e:
-            logging.error("Failed to send Discord message: %s", e)
-
-
-def launch_instance():
-    """Launches an OCI Compute instance using the specified parameters.
-
-    Raises:
-        Exception: Raises an exception if an unexpected error occurs.
-    """
-    # Step 1 - Get TENANCY
-    user_info = execute_oci_command(iam_client, "get_user", OCI_USER_ID)
-    oci_tenancy = user_info.compartment_id
-    logging.info("OCI_TENANCY: %s", oci_tenancy)
-
-    # Step 2 - Get AD Name
-    availability_domains = execute_oci_command(iam_client,
-                                               "list_availability_domains",
-                                               compartment_id=oci_tenancy)
-    oci_ad_name = [item.name for item in availability_domains if
-                   any(item.name.endswith(oct_ad) for oct_ad in OCT_FREE_AD.split(","))]
-    oci_ad_names = itertools.cycle(oci_ad_name)
-    logging.info("OCI_AD_NAME: %s", oci_ad_name)
-
-    # Step 3 - Get Subnet ID
-    oci_subnet_id = OCI_SUBNET_ID
-    if not oci_subnet_id:
-        subnets = execute_oci_command(network_client,
-                                      "list_subnets",
-                                      compartment_id=oci_tenancy)
-        oci_subnet_id = subnets[0].id
-    logging.info("OCI_SUBNET_ID: %s", oci_subnet_id)
-
-    # Step 4 - Get Image ID of Compute Shape
-    if not OCI_IMAGE_ID:
-        images = execute_oci_command(
-            compute_client,
-            "list_images",
-            compartment_id=oci_tenancy,
-            shape=OCI_COMPUTE_SHAPE,
+    # 5. Cau hinh Shape ARM
+    if OCI_COMPUTE_SHAPE == ARM_SHAPE:
+        shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(
+            ocpus=float(OCPUS),
+            memory_in_gbs=float(RAM_IN_GBS)
         )
-        shortened_images = [{key: json.loads(str(image))[key] for key in IMAGE_LIST_KEYS
-                             } for image in images]
-        write_into_file('images_list.json', json.dumps(shortened_images, indent=2))
-        oci_image_id = next(image.id for image in images if
-                            image.operating_system == OPERATING_SYSTEM and
-                            image.operating_system_version == OS_VERSION)
-        logging.info("OCI_IMAGE_ID: %s", oci_image_id)
     else:
-        oci_image_id = OCI_IMAGE_ID
+        shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1.0, memory_in_gbs=1.0)
 
-    assign_public_ip = ASSIGN_PUBLIC_IP.lower() in [ "true", "1", "y", "yes" ]
+    ad_cycle = itertools.cycle(target_ads)
+    attempt = 1
+    send_notification(f"🚀 [OCI Hunter] Bat dau san VPS ARM tai Tokyo ({OCPUS} OCPU / {RAM_IN_GBS}GB RAM) 24/7!")
 
-    boot_volume_size = max(50, int(BOOT_VOLUME_SIZE))
+    logger.info("==================================================================")
+    logger.info("BAT DAU VONG LAP SAN VPS ORACLE CLOUD ARM (ALWAY FREE)")
+    logger.info(f"Target: {OCI_COMPUTE_SHAPE} | {OCPUS} OCPUs | {RAM_IN_GBS} GB RAM | {BOOT_VOLUME_SIZE} GB Disk")
+    logger.info(f"Interval: ~{REQUEST_WAIT_TIME_SECS}s giua cac lan thu")
+    logger.info("==================================================================")
 
-    ssh_public_key = read_or_generate_ssh_public_key(SSH_AUTHORIZED_KEYS_FILE)
+    while True:
+        current_ad = next(ad_cycle)
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        logger.info(f"[Thu lan #{attempt} | {now_str}] Gui request tao VPS tai '{current_ad}'...")
 
-    # Step 5 - Launch Instance if it's not already exist and running
-    instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE, tries=1)
+        launch_details = oci.core.models.LaunchInstanceDetails(
+            availability_domain=current_ad,
+            compartment_id=tenancy_id,
+            display_name=DISPLAY_NAME,
+            shape=OCI_COMPUTE_SHAPE,
+            shape_config=shape_config,
+            create_vnic_details=oci.core.models.CreateVnicDetails(
+                assign_public_ip=ASSIGN_PUBLIC_IP,
+                assign_private_dns_record=True,
+                display_name=DISPLAY_NAME,
+                subnet_id=subnet_id
+            ),
+            source_details=oci.core.models.InstanceSourceViaImageDetails(
+                source_type="image",
+                image_id=image_id,
+                boot_volume_size_in_gbs=BOOT_VOLUME_SIZE
+            ),
+            metadata={"ssh_authorized_keys": ssh_key}
+        )
 
-    if OCI_COMPUTE_SHAPE == "VM.Standard.A1.Flex":
-        shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=2, memory_in_gbs=12)
-    else:
-        shape_config = oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=1, memory_in_gbs=1)
-
-    while not instance_exist_flag:
         try:
-            launch_instance_response = compute_client.launch_instance(
-                launch_instance_details=oci.core.models.LaunchInstanceDetails(
-                    availability_domain=next(oci_ad_names),
-                    compartment_id=oci_tenancy,
-                    create_vnic_details=oci.core.models.CreateVnicDetails(
-                        assign_public_ip=assign_public_ip,
-                        assign_private_dns_record=True,
-                        display_name=DISPLAY_NAME,
-                        subnet_id=oci_subnet_id,
-                    ),
-                    display_name=DISPLAY_NAME,
-                    shape=OCI_COMPUTE_SHAPE,
-                    availability_config=oci.core.models.LaunchInstanceAvailabilityConfigDetails(
-                        recovery_action="RESTORE_INSTANCE"
-                    ),
-                    instance_options=oci.core.models.InstanceOptions(
-                        are_legacy_imds_endpoints_disabled=False
-                    ),
-                    shape_config=shape_config,
-                    source_details=oci.core.models.InstanceSourceViaImageDetails(
-                        source_type="image",
-                        image_id=oci_image_id,
-                        boot_volume_size_in_gbs=boot_volume_size,
-                    ),
-                    metadata={
-                        "ssh_authorized_keys": ssh_public_key},
+            response = compute_client.launch_instance(launch_instance_details=launch_details)
+            if response.status in [200, 201]:
+                inst = response.data
+                success_msg = (
+                    f"🎉🎉 [THANH CONG] DA SAN DUOC VPS ORACLE ARM!\n"
+                    f"- Instance ID: {inst.id}\n"
+                    f"- Display Name: {inst.display_name}\n"
+                    f"- Availability Domain: {inst.availability_domain}\n"
+                    f"- Cau hinh: {OCPUS} OCPU | {RAM_IN_GBS} GB RAM | {BOOT_VOLUME_SIZE} GB Storage\n"
+                    f"- Thoi gian: {now_str}"
                 )
-            )
-            if launch_instance_response.status == 200:
-                logging_step5.info(
-                    "Command: launch_instance\nOutput: %s", launch_instance_response
-                )
-                instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
+                logger.info(success_msg)
+                send_notification(success_msg)
+                with open("INSTANCE_CREATED", "w", encoding="utf-8") as f:
+                    f.write(success_msg)
+                logger.info("Ket thuc tien trinh thanh cong. Dung vong lap.")
+                sys.exit(0)
 
         except oci.exceptions.ServiceError as srv_err:
-            if srv_err.code == "LimitExceeded":                
-                logging_step5.info("Encoundered LimitExceeded Error checking if instance is created" \
-                                   "code :%s, message: %s, status: %s", srv_err.code, srv_err.message, srv_err.status)                
-                instance_exist_flag = check_instance_state_and_write(oci_tenancy, OCI_COMPUTE_SHAPE)
-                if instance_exist_flag:
-                    logging_step5.info("%s , exiting the program", srv_err.code)
-                    sys.exit()
-                logging_step5.info("Didn't find an instance , proceeding with retries")     
-            data = {
-                "status": srv_err.status,
-                "code": srv_err.code,
-                "message": srv_err.message,
-            }
-            handle_errors("launch_instance", data, logging_step5)
-        except oci.exceptions.RequestException as req_err:
-            data = {
-                "status": None,
-                "code": "RequestException",
-                "message": str(req_err),
-            }
-            handle_errors("launch_instance", data, logging_step5)
+            status = srv_err.status
+            code = srv_err.code
+            msg = srv_err.message
 
+            if status in [500, 429, 502, 503, 504] or "capacity" in msg.lower() or code == "TooManyRequests":
+                logger.warning(f"⚠️ [Het Slot / Rate Limit] Code: {code} (HTTP {status}) - {msg.strip()}")
+            elif code == "LimitExceeded":
+                logger.warning(f"⚠️ [LimitExceeded]: Phat hien gioi han tai nguyen. Dang kiem tra xem VPS da tao chua...")
+                if check_existing_instance(tenancy_id):
+                    logger.info("[THANH CONG] Phat hien VPS da duoc khoi tao thanh cong! Ket thuc script.")
+                    sys.exit(0)
+            else:
+                logger.error(f"❌ [Loi OCI API] Code: {code} | Status: {status} | Msg: {msg}")
+
+        except (oci.exceptions.RequestException, Exception) as general_err:
+            logger.warning(f"⚠️ [Loi ket noi mang / Timeout tam thoi]: {general_err}")
+
+        # Thoi gian nghi kem Jitter ngau nhien
+        sleep_secs = REQUEST_WAIT_TIME_SECS + random.randint(1, 6)
+        logger.info(f"⏳ Nghi {sleep_secs} giay truoc lan thu tiep theo...\n")
+        time.sleep(sleep_secs)
+        attempt += 1
 
 if __name__ == "__main__":
-    send_discord_message("🚀 OCI Instance Creation Script: Starting up! Let's create some cloud magic!")
     try:
-        launch_instance()
-        send_discord_message("🎉 Success! OCI Instance has been created. Time to celebrate!")
-    except Exception as e:
-        error_message = f"😱 Oops! Something went wrong with the OCI Instance Creation Script:\n{str(e)}"
-        send_discord_message(error_message)
-        raise
+        run_hunter()
+    except KeyboardInterrupt:
+        logger.info("[DUNG] Nguoi dung chu dong ngat tien trinh (Ctrl+C).")
+        sys.exit(0)
+    except Exception as fatal:
+        logger.critical(f"[LOI FATAL]: {fatal}", exc_info=True)
+        send_notification(f"❌ [OCI Hunter] Script bi dung do loi: {fatal}")
+        sys.exit(1)
