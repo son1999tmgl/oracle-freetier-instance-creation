@@ -40,11 +40,16 @@ if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 
+class UnbufferedStreamHandler(logging.StreamHandler):
+    def emit(self, record):
+        super().emit(record)
+        self.flush()
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.StreamHandler(sys.stdout),
+        UnbufferedStreamHandler(sys.stdout),
         logging.FileHandler("launch_instance.log", encoding="utf-8")
     ]
 )
@@ -359,4 +364,5 @@ if __name__ == "__main__":
         logger.critical(f"[LOI FATAL]: {fatal}", exc_info=True)
         send_notification(f"âŒ [OCI Hunter] Script bi dung do loi: {fatal}")
         sys.exit(1)
+
 
