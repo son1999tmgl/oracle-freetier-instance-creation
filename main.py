@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Oracle Cloud Infrastructure (OCI) Always-Free Instance Hunter
@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 load_dotenv('oci.env')
 
 # Setup Logging dong thoi ra Console (cho Koyeb) va file log
-# Đảm bảo StreamHandler hỗ trợ UTF-8 cả trên Windows console và Linux/Koyeb
+# Äáº£m báº£o StreamHandler há»— trá»£ UTF-8 cáº£ trÃªn Windows console vÃ  Linux/Koyeb
 if sys.platform == "win32":
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
@@ -246,7 +246,7 @@ def run_hunter():
 
     ad_cycle = itertools.cycle(target_ads)
     attempt = 1
-    send_notification(f"🚀 [OCI Hunter] Bat dau san VPS ARM tai Tokyo ({OCPUS} OCPU / {RAM_IN_GBS}GB RAM) 24/7!")
+    send_notification(f"ðŸš€ [OCI Hunter] Bat dau san VPS ARM tai Tokyo ({OCPUS} OCPU / {RAM_IN_GBS}GB RAM) 24/7!")
 
     logger.info("==================================================================")
     logger.info("BAT DAU VONG LAP SAN VPS ORACLE CLOUD ARM (ALWAY FREE)")
@@ -284,7 +284,7 @@ def run_hunter():
             if response.status in [200, 201]:
                 inst = response.data
                 success_msg = (
-                    f"🎉🎉 [THANH CONG] DA SAN DUOC VPS ORACLE ARM!\n"
+                    f"ðŸŽ‰ðŸŽ‰ [THANH CONG] DA SAN DUOC VPS ORACLE ARM!\n"
                     f"- Instance ID: {inst.id}\n"
                     f"- Display Name: {inst.display_name}\n"
                     f"- Availability Domain: {inst.availability_domain}\n"
@@ -304,25 +304,52 @@ def run_hunter():
             msg = srv_err.message
 
             if status in [500, 429, 502, 503, 504] or "capacity" in msg.lower() or code == "TooManyRequests":
-                logger.warning(f"⚠️ [Het Slot / Rate Limit] Code: {code} (HTTP {status}) - {msg.strip()}")
+                logger.warning(f"âš ï¸ [Het Slot / Rate Limit] Code: {code} (HTTP {status}) - {msg.strip()}")
             elif code == "LimitExceeded":
-                logger.warning(f"⚠️ [LimitExceeded]: Phat hien gioi han tai nguyen. Dang kiem tra xem VPS da tao chua...")
+                logger.warning(f"âš ï¸ [LimitExceeded]: Phat hien gioi han tai nguyen. Dang kiem tra xem VPS da tao chua...")
                 if check_existing_instance(tenancy_id):
                     logger.info("[THANH CONG] Phat hien VPS da duoc khoi tao thanh cong! Ket thuc script.")
                     sys.exit(0)
             else:
-                logger.error(f"❌ [Loi OCI API] Code: {code} | Status: {status} | Msg: {msg}")
+                logger.error(f"âŒ [Loi OCI API] Code: {code} | Status: {status} | Msg: {msg}")
 
         except (oci.exceptions.RequestException, Exception) as general_err:
-            logger.warning(f"⚠️ [Loi ket noi mang / Timeout tam thoi]: {general_err}")
+            logger.warning(f"âš ï¸ [Loi ket noi mang / Timeout tam thoi]: {general_err}")
 
         # Thoi gian nghi kem Jitter ngau nhien
         sleep_secs = REQUEST_WAIT_TIME_SECS + random.randint(1, 6)
-        logger.info(f"⏳ Nghi {sleep_secs} giay truoc lan thu tiep theo...\n")
+        logger.info(f"â³ Nghi {sleep_secs} giay truoc lan thu tiep theo...\n")
         time.sleep(sleep_secs)
         attempt += 1
 
+# =============================================================
+# DUMMY HTTP SERVER CHO RENDER WEB SERVICE (PORT HEALTH CHECK)
+# =============================================================
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
+
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header('Content-type', 'text/plain; charset=utf-8')
+        self.end_headers()
+        self.wfile.write(b'OCI Instance Hunter is Running 24/7 on Render!')
+
+    def log_message(self, format, *args):
+        pass
+
+def run_background_http_server():
+    port = int(os.getenv("PORT", "10000"))
+    try:
+        server = HTTPServer(('0.0.0.0', port), HealthCheckHandler)
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        logger.info(f"[HEALTH CHECK] HTTP Server da mo tai cong {port} cho Render.")
+    except Exception as e:
+        logger.warning(f"Khong the mo HTTP port {port}: {e}")
+
 if __name__ == "__main__":
+    run_background_http_server()
     try:
         run_hunter()
     except KeyboardInterrupt:
@@ -330,5 +357,6 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as fatal:
         logger.critical(f"[LOI FATAL]: {fatal}", exc_info=True)
-        send_notification(f"❌ [OCI Hunter] Script bi dung do loi: {fatal}")
+        send_notification(f"âŒ [OCI Hunter] Script bi dung do loi: {fatal}")
         sys.exit(1)
+
