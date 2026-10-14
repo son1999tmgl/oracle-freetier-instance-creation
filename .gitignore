@@ -1,4 +1,4 @@
-﻿# Python runtime artifacts
+# Python runtime artifacts
 __pycache__/
 *.py[cod]
 *.class
@@ -10,3 +10,4 @@ venv/
 INSTANCE_CREATED
 images_list.json
 ERROR_IN_CONFIG.log
+hf_token.txt
