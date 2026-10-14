@@ -1,9 +1,9 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Oracle Cloud Infrastructure (OCI) Always-Free Instance Hunter
 Chuyen dung san VPS ARM Ampere VM.Standard.A1.Flex tai Tokyo (ap-tokyo-1)
-Chay ben bi 24/7 tren Koyeb Worker hoac Local Machine.
+Chay ben bi 24/7 tren Render Web Service hoac Local Machine.
 """
 
 import configparser
@@ -34,11 +34,13 @@ from dotenv import load_dotenv
 # Load bien moi truong tu oci.env neu co
 load_dotenv('oci.env')
 
-# Setup Logging dong thoi ra Console (cho Koyeb) va file log
-# Äáº£m báº£o StreamHandler há»— trá»£ UTF-8 cáº£ trÃªn Windows console vÃ  Linux/Koyeb
-if sys.platform == "win32":
-    import io
+# Setup Logging dong thoi ra Console (cho Render) va file log
+# Dam bao StreamHandler ho tro UTF-8 ca tren Windows console va Linux/Render
+import io
+if hasattr(sys.stdout, 'buffer'):
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+if hasattr(sys.stderr, 'buffer'):
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 class UnbufferedStreamHandler(logging.StreamHandler):
     def emit(self, record):
@@ -77,14 +79,14 @@ OCI_IMAGE_ID = os.getenv("OCI_IMAGE_ID", "").strip() or None
 DISCORD_WEBHOOK = os.getenv("DISCORD_WEBHOOK", "").strip()
 SSH_AUTHORIZED_KEYS_FILE = os.getenv("SSH_AUTHORIZED_KEYS_FILE", "./id_rsa.pub").strip()
 
-# Credentials qua Env (cho Koyeb Secrets) hoac qua File
+# Credentials qua Env (cho Render Environment Variables) hoac qua File
 OCI_CONFIG_FILE = os.getenv("OCI_CONFIG", "./oci_config").strip()
 OCI_KEY_CONTENT = os.getenv("OCI_KEY_CONTENT", "").strip()
 SSH_KEY_CONTENT = os.getenv("SSH_AUTHORIZED_KEY_CONTENT", "").strip()
 
 def initialize_oci_config() -> dict:
     """Khoi tao dictionary cau hinh OCI cho SDK"""
-    # 1. Truong hop truyen truc tiep Key qua ENV (Deploy tren Koyeb)
+    # 1. Truong hop truyen truc tiep Key qua ENV (Deploy tren Render)
     if OCI_KEY_CONTENT:
         key_target_path = Path("/tmp/oci_api_private_key.pem") if os.name != 'nt' else Path("./oci_api_private_key.pem")
         key_target_path.write_text(OCI_KEY_CONTENT.replace("\\n", "\n"), encoding="utf-8")
@@ -251,7 +253,7 @@ def run_hunter():
 
     ad_cycle = itertools.cycle(target_ads)
     attempt = 1
-    send_notification(f"ðŸš€ [OCI Hunter] Bat dau san VPS ARM tai Tokyo ({OCPUS} OCPU / {RAM_IN_GBS}GB RAM) 24/7!")
+    send_notification(f"[OCI Hunter] Bat dau san VPS ARM tai Tokyo ({OCPUS} OCPU / {RAM_IN_GBS}GB RAM) 24/7!")
 
     logger.info("==================================================================")
     logger.info("BAT DAU VONG LAP SAN VPS ORACLE CLOUD ARM (ALWAY FREE)")
@@ -289,7 +291,7 @@ def run_hunter():
             if response.status in [200, 201]:
                 inst = response.data
                 success_msg = (
-                    f"ðŸŽ‰ðŸŽ‰ [THANH CONG] DA SAN DUOC VPS ORACLE ARM!\n"
+                    f"[THANH CONG] DA SAN DUOC VPS ORACLE ARM!\n"
                     f"- Instance ID: {inst.id}\n"
                     f"- Display Name: {inst.display_name}\n"
                     f"- Availability Domain: {inst.availability_domain}\n"
@@ -309,21 +311,21 @@ def run_hunter():
             msg = srv_err.message
 
             if status in [500, 429, 502, 503, 504] or "capacity" in msg.lower() or code == "TooManyRequests":
-                logger.warning(f"âš ï¸ [Het Slot / Rate Limit] Code: {code} (HTTP {status}) - {msg.strip()}")
+                logger.warning(f"[!] [Het Slot / Rate Limit] Code: {code} (HTTP {status}) - {msg.strip()}")
             elif code == "LimitExceeded":
-                logger.warning(f"âš ï¸ [LimitExceeded]: Phat hien gioi han tai nguyen. Dang kiem tra xem VPS da tao chua...")
+                logger.warning(f"[!] [LimitExceeded]: Phat hien gioi han tai nguyen. Dang kiem tra xem VPS da tao chua...")
                 if check_existing_instance(tenancy_id):
                     logger.info("[THANH CONG] Phat hien VPS da duoc khoi tao thanh cong! Ket thuc script.")
                     sys.exit(0)
             else:
-                logger.error(f"âŒ [Loi OCI API] Code: {code} | Status: {status} | Msg: {msg}")
+                logger.error(f"[LOI] [Loi OCI API] Code: {code} | Status: {status} | Msg: {msg}")
 
         except (oci.exceptions.RequestException, Exception) as general_err:
-            logger.warning(f"âš ï¸ [Loi ket noi mang / Timeout tam thoi]: {general_err}")
+            logger.warning(f"[!] [Loi ket noi mang / Timeout tam thoi]: {general_err}")
 
         # Thoi gian nghi kem Jitter ngau nhien
         sleep_secs = REQUEST_WAIT_TIME_SECS + random.randint(1, 6)
-        logger.info(f"â³ Nghi {sleep_secs} giay truoc lan thu tiep theo...\n")
+        logger.info(f"[*] Nghi {sleep_secs} giay truoc lan thu tiep theo...\n")
         time.sleep(sleep_secs)
         attempt += 1
 
@@ -362,7 +364,7 @@ if __name__ == "__main__":
         sys.exit(0)
     except Exception as fatal:
         logger.critical(f"[LOI FATAL]: {fatal}", exc_info=True)
-        send_notification(f"âŒ [OCI Hunter] Script bi dung do loi: {fatal}")
+        send_notification(f"[LOI] [OCI Hunter] Script bi dung do loi: {fatal}")
         sys.exit(1)
 
 
